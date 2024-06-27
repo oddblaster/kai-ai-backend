@@ -21,6 +21,7 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from app.services.logger import setup_logger
 from app.services.tool_registry import ToolFile
 from app.api.error_utilities import LoaderError
+from pptx import Presentation
 
 relative_path = "features/quzzify"
 
@@ -49,20 +50,21 @@ def read_text_file(file_path):
 
     # Combine the script directory with the relative file path
     absolute_file_path = os.path.join(script_dir, file_path)
-    
+
     with open(absolute_file_path, 'r') as file:
         return file.read()
+
 
 class RAGRunnable:
     def __init__(self, func):
         self.func = func
-    
+
     def __or__(self, other):
         def chained_func(*args, **kwargs):
             # Result of previous function is passed as first argument to next function
             return other(self.func(*args, **kwargs))
         return RAGRunnable(chained_func)
-    
+
     def __call__(self, *args, **kwargs):
         return self.func(*args, **kwargs)
 
@@ -89,10 +91,10 @@ class UploadPDFLoader:
 class BytesFilePDFLoader:
     def __init__(self, files: List[Tuple[BytesIO, str]]):
         self.files = files
-    
+
     def load(self) -> List[Document]:
         documents = []
-        
+
         for file, file_type in self.files:
             logger.debug(file_type)
             if file_type.lower() == "pdf":
@@ -104,10 +106,10 @@ class BytesFilePDFLoader:
 
                     doc = Document(page_content=page_content, metadata=metadata)
                     documents.append(doc)
-                    
+
             else:
                 raise ValueError(f"Unsupported file type: {file_type}")
-            
+
         return documents
 
 class LocalFileLoader:
@@ -117,12 +119,12 @@ class LocalFileLoader:
 
     def load(self) -> List[Document]:
         documents = []
-        
+
         # Ensure file paths is a list
         self.file_paths = [self.file_paths] if isinstance(self.file_paths, str) else self.file_paths
-    
+
         for file_path in self.file_paths:
-            
+
             file_type = file_path.split(".")[-1]
 
             if file_type != self.expected_file_type:
@@ -161,7 +163,6 @@ class URLLoader:
                 if response.status_code == 200:
                     # Read file
                     file_content = BytesIO(response.content)
-
                     # Check file type
                     file_type = path.split(".")[-1]
                     if file_type != self.expected_file_type:
@@ -184,6 +185,7 @@ class URLLoader:
         # Pass Queue to the file loader if there are any successful loads
         if any_success:
             file_loader = self.loader(queued_files)
+
             documents = file_loader.load()
 
             if self.verbose:
@@ -194,71 +196,115 @@ class URLLoader:
 
         return documents
 
+class PowerPointLoader:
+
+    def __init__(self, verbose=False):
+        self.verbose = verbose
+
+    def load(self, files: List[ToolFile]) -> List[Document]:
+        logger.info("PPL load")
+        self.files = files
+        documents: List[Document] = []
+
+        for tool_file in self.files:
+            try:
+                url = tool_file.url
+                path = urlparse(url).path
+                file_type = url.split(".")[-1]
+                if file_type not in ('pptx', 'ppt'):
+                    raise LoaderError(f"Expected ppt/pptx file but got {file_type}")
+                page_content = ""
+                response = requests.get(url, stream=True)
+                content = BytesIO(response.content)
+                prs = Presentation(content)
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if hasattr(shape, "text"):
+                            page_content += shape.text + " "
+                            logger.info(f"{shape.text}")
+                metadata = {"source": path}
+                doc = Document(page_content=page_content, metadata=metadata)
+                documents.append(doc)
+                if self.verbose: logger.info(f"Succesfully loaded file from {url}")
+            except Exception as e:
+                logger.error(f"Failed to load file from {url}")
+                logger.error(e)
+                continue
+
+        if len(documents) == 0:
+            raise LoaderError("Unable to load any files")
+        if self.verbose:
+            logger.info(f"Loaded {len(documents)} documents")
+        return documents
+
+
 class RAGpipeline:
-    def __init__(self, loader=None, splitter=None, vectorstore_class=None, embedding_model=None, verbose=False):
+    def __init__(self, loader=None, splitter=None, vectorstore_class=None, embedding_model=None, verbose=False, file_type=None):
         default_config = {
-            "loader": URLLoader(verbose = verbose), # Creates instance on call with verbosity
+            "loader": URLLoader(verbose=verbose), # Creates instance on call with verbosity
             "splitter": RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100),
             "vectorstore_class": Chroma,
             "embedding_model": GoogleGenerativeAIEmbeddings(model='models/embedding-001')
         }
         self.loader = loader or default_config["loader"]
+        if file_type and file_type in ('pptx', 'ppt'):
+            self.loader = PowerPointLoader(verbose=verbose)
         self.splitter = splitter or default_config["splitter"]
         self.vectorstore_class = vectorstore_class or default_config["vectorstore_class"]
         self.embedding_model = embedding_model or default_config["embedding_model"]
         self.verbose = verbose
 
-    def load_PDFs(self, files) -> List[Document]:
+    def load_PDFs(self, files: List[ToolFile]) -> List[Document]:
         if self.verbose:
             logger.info(f"Loading {len(files)} files")
             logger.info(f"Loader type used: {type(self.loader)}")
-        
+
         logger.debug(f"Loader is a: {type(self.loader)}")
-        
+
         try:
             total_loaded_files = self.loader.load(files)
         except LoaderError as e:
             logger.error(f"Loader experienced error: {e}")
             raise LoaderError(e)
-            
+
         return total_loaded_files
-    
+
     def split_loaded_documents(self, loaded_documents: List[Document]) -> List[Document]:
         if self.verbose:
             logger.info(f"Splitting {len(loaded_documents)} documents")
             logger.info(f"Splitter type used: {type(self.splitter)}")
-            
+
         total_chunks = []
         chunks = self.splitter.split_documents(loaded_documents)
         total_chunks.extend(chunks)
-        
+
         if self.verbose: logger.info(f"Split {len(loaded_documents)} documents into {len(total_chunks)} chunks")
-        
+
         return total_chunks
-    
+
     def create_vectorstore(self, documents: List[Document]):
         if self.verbose:
             logger.info(f"Creating vectorstore from {len(documents)} documents")
-        
+
         self.vectorstore = self.vectorstore_class.from_documents(documents, self.embedding_model)
 
         if self.verbose: logger.info(f"Vectorstore created")
         return self.vectorstore
-    
+
     def compile(self):
         # Compile the pipeline
         self.load_PDFs = RAGRunnable(self.load_PDFs)
         self.split_loaded_documents = RAGRunnable(self.split_loaded_documents)
         self.create_vectorstore = RAGRunnable(self.create_vectorstore)
         if self.verbose: logger.info(f"Completed pipeline compilation")
-    
+
     def __call__(self, documents):
-        # Returns a vectorstore ready for usage 
-        
-        if self.verbose: 
+        # Returns a vectorstore ready for usage
+
+        if self.verbose:
             logger.info(f"Executing pipeline")
             logger.info(f"Start of Pipeline received: {len(documents)} documents of type {type(documents[0])}")
-        
+
         pipeline = self.load_PDFs | self.split_loaded_documents | self.create_vectorstore
         return pipeline(documents)
 
@@ -269,18 +315,18 @@ class QuizBuilder:
             "parser": JsonOutputParser(pydantic_object=QuizQuestion),
             "prompt": read_text_file("prompt/quizzify-prompt.txt")
         }
-        
+
         self.prompt = prompt or default_config["prompt"]
         self.model = model or default_config["model"]
         self.parser = parser or default_config["parser"]
-        
+
         self.vectorstore = vectorstore
         self.topic = topic
         self.verbose = verbose
-        
+
         if vectorstore is None: raise ValueError("Vectorstore must be provided")
         if topic is None: raise ValueError("Topic must be provided")
-    
+
     def compile(self):
         # Return the chain
         prompt = PromptTemplate(
@@ -288,17 +334,17 @@ class QuizBuilder:
             input_variables=["topic"],
             partial_variables={"format_instructions": self.parser.get_format_instructions()}
         )
-        
+
         retriever = self.vectorstore.as_retriever()
-        
+
         runner = RunnableParallel(
             {"context": retriever, "topic": RunnablePassthrough()}
         )
-        
+
         chain = runner | prompt | self.model | self.parser
-        
+
         if self.verbose: logger.info(f"Chain compilation complete")
-        
+
         return chain
 
     def validate_response(self, response: Dict) -> bool:
@@ -320,15 +366,15 @@ class QuizBuilder:
 
     def format_choices(self, choices: Dict[str, str]) -> List[Dict[str, str]]:
         return [{"key": k, "value": v} for k, v in choices.items()]
-    
+
     def create_questions(self, num_questions: int = 5) -> List[Dict]:
         if self.verbose: logger.info(f"Creating {num_questions} questions")
-        
+
         if num_questions > 10:
-            return {"message": "error", "data": "Number of questions cannot exceed 10"}
-        
+            return [{"message": "error", "data": "Number of questions cannot exceed 10"}]
+
         chain = self.compile()
-        
+
         generated_questions = []
         attempts = 0
         max_attempts = num_questions * 5  # Allow for more attempts to generate questions
@@ -349,17 +395,17 @@ class QuizBuilder:
             else:
                 if self.verbose:
                     logger.warning(f"Invalid response format. Attempt {attempts + 1} of {max_attempts}")
-            
+
             # Move to the next attempt regardless of success to ensure progress
             attempts += 1
 
         # Log if fewer questions are generated
         if len(generated_questions) < num_questions:
             logger.warning(f"Only generated {len(generated_questions)} out of {num_questions} requested questions")
-        
+
         if self.verbose: logger.info(f"Deleting vectorstore")
         self.vectorstore.delete_collection()
-        
+
         # Return the list of questions
         return generated_questions[:num_questions]
 
@@ -374,7 +420,7 @@ class QuizQuestion(BaseModel):
 
     model_config = {
         "json_schema_extra": {
-            "examples": """ 
+            "examples": """
                 {
                 "question": "What is the capital of France?",
                 "choices": [
@@ -389,5 +435,5 @@ class QuizQuestion(BaseModel):
           """
         }
 
-      }
+    }
 

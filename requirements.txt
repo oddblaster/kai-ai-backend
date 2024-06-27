@@ -16,3 +16,6 @@ fpdf
 youtube-transcript-api
 pytube
 python-dotenv
+unstructured
+python-magic
+python-pptx
